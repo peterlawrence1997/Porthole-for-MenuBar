@@ -19,6 +19,9 @@ mkdir -p "${APP_BUNDLE}/Contents/Resources"
 echo "Copying Executable..."
 cp ".build/release/${EXECUTABLE_NAME}" "${APP_BUNDLE}/Contents/MacOS/"
 
+echo "Copying Menu Bar Icon..."
+cp "Sources/PortholeStorageMonitor/Resources/CompactIcon.png" "${APP_BUNDLE}/Contents/Resources/"
+
 echo "Copying Info.plist..."
 cp "Info.plist" "${APP_BUNDLE}/Contents/"
 
@@ -48,6 +51,7 @@ rm -rf DiskSpaceApp.iconset
 rm DiskSpaceApp.icns
 
 echo "Signing App Bundle..."
+xattr -cr "${APP_BUNDLE}"
 codesign --force --deep --sign - "${APP_BUNDLE}"
 
 echo "Done! ${APP_BUNDLE} created."
