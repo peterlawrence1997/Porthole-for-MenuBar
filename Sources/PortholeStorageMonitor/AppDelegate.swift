@@ -10,9 +10,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
         if let button = statusItem.button {
-            button.image = NSImage(
-                systemSymbolName: "externaldrive.fill", accessibilityDescription: "Disk Space")
-            button.imagePosition = .imageLeft
+            button.image = Self.makeMenuBarIcon()
+            button.imagePosition = .imageRight
         }
 
         setupMenu()
@@ -23,6 +22,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         timer = Timer.scheduledTimer(withTimeInterval: 60.0, repeats: true) { _ in
             self.updateDiskSpace()
         }
+    }
+
+    /// Loads the compact disk-drive glyph as a template image so AppKit tints it
+    /// automatically for light/dark mode, selection, and wallpaper tinting.
+    static func makeMenuBarIcon() -> NSImage? {
+        // Bundle.main.Resources is where the packaged .app ships the icon (see bundle.sh);
+        // Bundle.module covers `swift run` during local development.
+        let url = Bundle.main.url(forResource: "CompactIcon", withExtension: "png")
+            ?? Bundle.module.url(forResource: "CompactIcon", withExtension: "png")
+        guard let url, let icon = NSImage(contentsOf: url) else { return nil }
+
+        let height: CGFloat = 18
+        let width = height * (icon.size.width / icon.size.height)
+        icon.size = NSSize(width: width, height: height)
+        icon.isTemplate = true
+        return icon
     }
 
     func setupMenu() {
@@ -66,7 +81,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let tracker = DiskActivityTracker.shared
         tracker.recordFreeSpace(bytes: bytes)
         let delta = tracker.shouldShowMenuBarArrow() ? tracker.freeSpaceDelta() : nil
-        let text = DiskUtils.formatGB(bytes)
+        // Number only — the "GB" label lives inside the compact drive icon.
+        let text = DiskUtils.formatGB(bytes).replacingOccurrences(of: " GB", with: "")
         DispatchQueue.main.async {
             guard let button = self.statusItem.button else { return }
             button.attributedTitle = Self.tickerTitle(text: text, delta: delta)
@@ -113,8 +129,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             attributed.append(arrowAttr)
         }
 
+        // Thin space keeps a small gap between the number and the drive icon,
+        // which sits to the right of the title (imagePosition = .imageRight).
         let textAttr = NSAttributedString(
-            string: text,
+            string: text + "\u{2009}",
             attributes: [.font: NSFont.menuBarFont(ofSize: 0)]
         )
         attributed.append(textAttr)
