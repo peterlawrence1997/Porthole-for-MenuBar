@@ -11,6 +11,8 @@ final class DiskActivityTracker {
         let rescanThrottle: TimeInterval
         let dirtyCheckInterval: TimeInterval
         let fullPassInterval: TimeInterval
+        let fallbackPassInterval: TimeInterval  // used when FSEvents is unavailable
+        let expensiveScanThreshold: TimeInterval
         let menuBarThreshold: Int64
         let listThreshold: Int64
         let listLimit: Int
@@ -25,6 +27,8 @@ final class DiskActivityTracker {
                     rescanThrottle: 15,
                     dirtyCheckInterval: 5,
                     fullPassInterval: 60,
+                    fallbackPassInterval: 30,
+                    expensiveScanThreshold: 20,
                     menuBarThreshold: 500_000_000,
                     listThreshold: 100_000_000,
                     listLimit: 5
@@ -37,6 +41,8 @@ final class DiskActivityTracker {
                     rescanThrottle: 300,
                     dirtyCheckInterval: 60,
                     fullPassInterval: 3600,
+                    fallbackPassInterval: 600,
+                    expensiveScanThreshold: 20,
                     menuBarThreshold: 2_000_000_000,
                     listThreshold: 100_000_000,
                     listLimit: 5
@@ -67,8 +73,13 @@ final class DiskActivityTracker {
     private var trackedDirs: [TrackedDirectory] = []
     private var dirHistory: [String: [SizeSample]] = [:]
     private var freeHistory: [SizeSample] = []
-    private let queue = DispatchQueue(label: "com.porthole.diskactivity", qos: .utility)
+    // State queue: guards all mutable state; only short operations run here so the
+    // main thread's queue.sync reads never wait behind a directory scan.
+    private let queue = DispatchQueue(label: "com.porthole.diskactivity.state", qos: .utility)
+    // Scan queue: file enumeration only; results are handed back to the state queue.
+    private let scanQueue = DispatchQueue(label: "com.porthole.diskactivity.scan", qos: .utility)
     private var eventStream: FSEventStreamRef?
+    private var usingFallback = false
     private var isScanning = false
     private var dirtyCheckTimer: Timer?
     private var fullPassTimer: Timer?
@@ -80,16 +91,15 @@ final class DiskActivityTracker {
     func start() {
         queue.async {
             self.buildTrackedDirectories()
-            self.performFullPass()
             self.startEventStream()
             self.scheduleTimers()
+            self.performFullPass()
         }
     }
 
     func recordFreeSpace(bytes: Int64) {
         queue.async {
-            let sample = SizeSample(date: Date(), bytes: bytes)
-            self.freeHistory.append(sample)
+            self.freeHistory.append(SizeSample(date: Date(), bytes: bytes))
             self.pruneHistory(of: &self.freeHistory)
         }
     }
@@ -102,164 +112,186 @@ final class DiskActivityTracker {
 
     func topMovers() -> [ActivityEntry]? {
         return queue.sync {
-            guard hasValidHistoryBaseline() else { return nil }
+            guard let freeDelta = delta(in: freeHistory) else { return nil }
 
-            var entries: [(displayName: String, url: URL?, delta: Int64)] = []
+            var entries: [(displayName: String, url: URL, delta: Int64)] = []
+            var trackedTotal: Int64 = 0
 
             for dir in trackedDirs {
-                guard let delta = delta(in: dirHistory[dir.url.path] ?? []) else { continue }
-                if abs(delta) >= config.listThreshold {
-                    entries.append((displayName: dir.displayName, url: dir.url, delta: delta))
+                guard let d = delta(in: dirHistory[dir.url.path] ?? []) else { continue }
+                trackedTotal += d
+                if abs(d) >= config.listThreshold {
+                    entries.append((displayName: dir.displayName, url: dir.url, delta: d))
                 }
             }
 
             entries.sort { abs($0.delta) > abs($1.delta) }
-            let dirEntries = entries.prefix(config.listLimit).map { entry -> ActivityEntry in
-                .directory(url: entry.url!, displayName: entry.displayName, deltaBytes: entry.delta)
+            var result = entries.prefix(config.listLimit).map { entry -> ActivityEntry in
+                .directory(url: entry.url, displayName: entry.displayName, deltaBytes: entry.delta)
             }
 
-            guard let freeDelta = delta(in: freeHistory) else { return Array(dirEntries) }
-            let trackedDelta = entries.prefix(config.listLimit).reduce(0) { $0 + $1.delta }
-            let remainder = (-freeDelta) - trackedDelta
-
-            var result = Array(dirEntries)
+            // Everything outside the tracked set, in aggregate. Negated because
+            // free space falling means usage rising.
+            let remainder = (-freeDelta) - trackedTotal
             if abs(remainder) >= config.listThreshold {
                 result.append(.remainder(deltaBytes: remainder))
             }
 
-            return result.isEmpty ? [] : result
+            return result
         }
     }
 
     func shouldShowMenuBarArrow() -> Bool {
         return queue.sync {
-            guard let freeDelta = delta(in: freeHistory) else { return false }
-            guard abs(freeDelta) >= config.menuBarThreshold else { return false }
+            guard let freeDelta = delta(in: freeHistory),
+                abs(freeDelta) >= config.menuBarThreshold
+            else { return false }
 
-            let hasTrackedMovement = trackedDirs.contains { dir in
-                if let delta = delta(in: dirHistory[dir.url.path] ?? []) {
-                    return abs(delta) >= config.listThreshold
+            // Attribution guard: only show the arrow when at least one tracked
+            // directory moved too, so purgeable/snapshot churn doesn't cry wolf.
+            return trackedDirs.contains { dir in
+                if let d = delta(in: dirHistory[dir.url.path] ?? []) {
+                    return abs(d) >= config.listThreshold
                 }
                 return false
             }
-            return hasTrackedMovement
         }
     }
 
-    // MARK: - Private Helpers
+    // MARK: - Delta / history helpers (state queue only)
 
     private func delta(in samples: [SizeSample]) -> Int64? {
-        guard !samples.isEmpty else { return nil }
-
+        guard let latest = samples.last, let oldest = samples.first else { return nil }
         let now = Date()
-        let window = config.window
 
-        let baseline = samples.last(where: { now.timeIntervalSince($0.date) <= window })
-            ?? (samples.first.map { sample in
-                (now.timeIntervalSince(sample.date) >= config.window * config.minHistoryFraction) ? sample : nil
-            } ?? nil)
-
-        guard let baseline = baseline else { return nil }
-        guard let latest = samples.last else { return nil }
-
-        return latest.bytes - baseline.bytes
+        // Baseline: newest sample at least `window` old.
+        if let baseline = samples.last(where: { now.timeIntervalSince($0.date) >= config.window }) {
+            return latest.bytes - baseline.bytes
+        }
+        // Young history: accept the oldest sample if it covers most of the window.
+        if now.timeIntervalSince(oldest.date) >= config.window * config.minHistoryFraction {
+            return latest.bytes - oldest.bytes
+        }
+        return nil
     }
 
     private func pruneHistory(of samples: inout [SizeSample]) {
         let threshold = Date().addingTimeInterval(-config.retention)
-        samples.removeAll { $0.date < threshold }
+        // Keep one sample older than the window so a baseline always exists.
+        while samples.count > 1 && samples[0].date < threshold {
+            samples.removeFirst()
+        }
     }
 
-    private func hasValidHistoryBaseline() -> Bool {
-        guard !freeHistory.isEmpty else { return false }
-        return delta(in: freeHistory) != nil
-    }
+    // MARK: - Tracked directory set (state queue only)
 
     private func buildTrackedDirectories() {
         var dirs: [TrackedDirectory] = []
-
         let fileManager = FileManager.default
-        guard let homeURL = fileManager.urls(for: .userDirectory, in: .userDomainMask).first else {
-            return
-        }
+        let homeURL = fileManager.homeDirectoryForCurrentUser
 
-        do {
-            let contents = try fileManager.contentsOfDirectory(
-                at: homeURL,
-                includingPropertiesForKeys: [.isDirectoryKey],
-                options: [.skipsHiddenFiles]
-            )
-
+        // Visible top-level home folders, excluding ~/Library (covered by Caches below).
+        if let contents = try? fileManager.contentsOfDirectory(
+            at: homeURL,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) {
             for url in contents {
-                let values = try url.resourceValues(forKeys: [.isDirectoryKey])
-                if values.isDirectory == true {
-                    dirs.append(
-                        TrackedDirectory(url: url, displayName: url.lastPathComponent)
-                    )
+                guard url.lastPathComponent != "Library" else { continue }
+                let values = try? url.resourceValues(forKeys: [.isDirectoryKey])
+                if values?.isDirectory == true {
+                    dirs.append(TrackedDirectory(url: url, displayName: url.lastPathComponent))
                 }
             }
-        } catch {
-            print("Error building tracked directories: \(error)")
         }
 
         if let cachesURL = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first {
             dirs.append(TrackedDirectory(url: cachesURL, displayName: "Caches"))
         }
 
-        let trashURL = fileManager.urls(for: .trashDirectory, in: .userDomainMask).first ?? URL(
-            fileURLWithPath: NSHomeDirectory() + "/.Trash"
-        )
+        let trashURL = fileManager.urls(for: .trashDirectory, in: .userDomainMask).first
+            ?? homeURL.appendingPathComponent(".Trash")
         dirs.append(TrackedDirectory(url: trashURL, displayName: "Trash"))
 
         let tempDir = NSTemporaryDirectory()
         if !tempDir.isEmpty {
-            let tempUrl = URL(fileURLWithPath: tempDir)
-            let systemTempUrl = tempUrl.deletingLastPathComponent()
+            // NSTemporaryDirectory() -> /var/folders/xx/yyyy/T/; track /var/folders/xx/yyyy/
+            let systemTempUrl = URL(fileURLWithPath: tempDir).deletingLastPathComponent()
             dirs.append(TrackedDirectory(url: systemTempUrl, displayName: "System Temp"))
         }
 
-        self.trackedDirs = dirs
+        self.trackedDirs = dirs.filter {
+            fileManager.isReadableFile(atPath: $0.url.path)
+        }
     }
 
+    // MARK: - Scanning
+
+    // Must be called on the state queue.
     private func performFullPass() {
         guard !isScanning else { return }
+        for i in trackedDirs.indices {
+            trackedDirs[i].dirtySince = nil
+        }
+        requestScan(of: trackedDirs)
+    }
+
+    // Must be called on the state queue. Enumeration happens on scanQueue so the
+    // state queue stays responsive; results hop back here.
+    private func requestScan(of dirs: [TrackedDirectory]) {
+        guard !dirs.isEmpty, !isScanning else { return }
         isScanning = true
 
-        let directoriesSnapshot = trackedDirs
-        var scanResults: [String: Int64] = [:]
-        let startTime = Date()
-
-        for dir in directoriesSnapshot {
-            let result = calculateDirectorySize(at: dir.url)
-            scanResults[dir.url.path] = result.bytes
-
-            let elapsed = Date().timeIntervalSince(startTime)
-            if elapsed > 20 {
-                var updatedDir = dir
-                updatedDir.expensive = true
-                if let index = self.trackedDirs.firstIndex(where: { $0.url == dir.url }) {
-                    self.trackedDirs[index] = updatedDir
-                }
-                break
+        scanQueue.async {
+            var results: [(path: String, bytes: Int64, elapsed: TimeInterval)] = []
+            for dir in dirs {
+                let result = Self.calculateDirectorySize(at: dir.url)
+                results.append((dir.url.path, result.bytes, result.elapsed))
             }
-        }
 
-        for (path, bytes) in scanResults {
-            let sample = SizeSample(date: Date(), bytes: bytes)
-            dirHistory[path, default: []].append(sample)
-            pruneHistory(of: &dirHistory[path]!)
-        }
+            self.queue.async {
+                let now = Date()
+                for r in results {
+                    self.dirHistory[r.path, default: []].append(
+                        SizeSample(date: now, bytes: r.bytes))
+                    self.pruneHistory(of: &self.dirHistory[r.path]!)
 
-        isScanning = false
-
-        DispatchQueue.main.async {
-            self.onUpdate?()
+                    if let i = self.trackedDirs.firstIndex(where: { $0.url.path == r.path }) {
+                        self.trackedDirs[i].lastScanStart = now
+                        if r.elapsed > self.config.expensiveScanThreshold {
+                            self.trackedDirs[i].expensive = true
+                        }
+                    }
+                }
+                self.isScanning = false
+                DispatchQueue.main.async { self.onUpdate?() }
+            }
         }
     }
 
-    private func calculateDirectorySize(at url: URL) -> (bytes: Int64, elapsed: TimeInterval) {
+    // Must be called on the state queue.
+    private func checkDirtyDirectories() {
+        guard !isScanning else { return }  // keep dirty flags; retry next tick
+        let now = Date()
+        var toScan: [TrackedDirectory] = []
+
+        for i in trackedDirs.indices {
+            guard trackedDirs[i].dirtySince != nil else { continue }
+            let throttle =
+                trackedDirs[i].expensive ? config.rescanThrottle * 3 : config.rescanThrottle
+            if let last = trackedDirs[i].lastScanStart, now.timeIntervalSince(last) < throttle {
+                continue  // scanned recently; stays dirty, picked up later
+            }
+            trackedDirs[i].dirtySince = nil
+            toScan.append(trackedDirs[i])
+        }
+
+        requestScan(of: toScan)
+    }
+
+    private static func calculateDirectorySize(at url: URL) -> (bytes: Int64, elapsed: TimeInterval)
+    {
         let startTime = Date()
-        let fileManager = FileManager.default
         var size: Int64 = 0
 
         let resourceKeys: [URLResourceKey] = [
@@ -270,8 +302,10 @@ final class DiskActivityTracker {
             .fileSizeKey,
         ]
 
+        // Deliberately no skip options: package contents and hidden files count
+        // toward real disk usage, which is what free space measures.
         guard
-            let enumerator = fileManager.enumerator(
+            let enumerator = FileManager.default.enumerator(
                 at: url,
                 includingPropertiesForKeys: resourceKeys,
                 options: [],
@@ -282,32 +316,26 @@ final class DiskActivityTracker {
         }
 
         for case let fileURL as URL in enumerator {
-            do {
-                let resourceValues = try fileURL.resourceValues(forKeys: Set(resourceKeys))
+            guard let values = try? fileURL.resourceValues(forKeys: Set(resourceKeys)),
+                values.isRegularFile == true,
+                values.isSymbolicLink != true
+            else { continue }
 
-                if resourceValues.isRegularFile != true {
-                    continue
-                }
-
-                if resourceValues.isSymbolicLink == true {
-                    continue
-                }
-
-                if let size_ = resourceValues.totalFileAllocatedSize {
-                    size += Int64(size_)
-                } else if let size_ = resourceValues.fileAllocatedSize {
-                    size += Int64(size_)
-                } else if let size_ = resourceValues.fileSize {
-                    size += Int64(size_)
-                }
-            } catch {
-                continue
+            if let s = values.totalFileAllocatedSize {
+                size += Int64(s)
+            } else if let s = values.fileAllocatedSize {
+                size += Int64(s)
+            } else if let s = values.fileSize {
+                size += Int64(s)
             }
         }
 
         return (size, Date().timeIntervalSince(startTime))
     }
 
+    // MARK: - FSEvents
+
+    // Must be called on the state queue (before scheduleTimers, so usingFallback is set).
     private func startEventStream() {
         let paths = trackedDirs.map { $0.url.path } as CFArray
         var context = FSEventStreamContext(
@@ -339,7 +367,7 @@ final class DiskActivityTracker {
 
         guard let stream = eventStream else {
             print("Failed to create FSEventStream, falling back to fixed-interval scanning")
-            scheduleFixedIntervalScanning()
+            usingFallback = true
             return
         }
 
@@ -352,75 +380,8 @@ final class DiskActivityTracker {
             print("Failed to start FSEventStream, falling back to fixed-interval scanning")
             FSEventStreamInvalidate(stream)
             FSEventStreamRelease(stream)
-            self.eventStream = nil
-            scheduleFixedIntervalScanning()
-        }
-    }
-
-    private func scheduleFixedIntervalScanning() {
-        DispatchQueue.main.async {
-            self.fullPassTimer = Timer.scheduledTimer(
-                withTimeInterval: self.config.fullPassInterval * 10,
-                repeats: true
-            ) { _ in
-                self.queue.async {
-                    self.performFullPass()
-                }
-            }
-        }
-    }
-
-    private func scheduleTimers() {
-        DispatchQueue.main.async {
-            self.dirtyCheckTimer = Timer.scheduledTimer(
-                withTimeInterval: self.config.dirtyCheckInterval,
-                repeats: true
-            ) { _ in
-                self.queue.async {
-                    self.checkDirtyDirectories()
-                }
-            }
-
-            self.fullPassTimer = Timer.scheduledTimer(
-                withTimeInterval: self.config.fullPassInterval,
-                repeats: true
-            ) { _ in
-                self.queue.async {
-                    self.performFullPass()
-                }
-            }
-        }
-    }
-
-    private func checkDirtyDirectories() {
-        let now = Date()
-        var dirsToScan: [TrackedDirectory] = []
-
-        for dir in trackedDirs {
-            guard let dirtySince = dir.dirtySince else { continue }
-            let timeSinceDirty = now.timeIntervalSince(dirtySince)
-            let throttle = dir.expensive ? config.rescanThrottle * 3 : config.rescanThrottle
-
-            if timeSinceDirty >= throttle {
-                dirsToScan.append(dir)
-            }
-        }
-
-        guard !dirsToScan.isEmpty else { return }
-
-        for dir in dirsToScan {
-            if let index = trackedDirs.firstIndex(where: { $0.url == dir.url }) {
-                trackedDirs[index].dirtySince = nil
-            }
-
-            let result = calculateDirectorySize(at: dir.url)
-            let sample = SizeSample(date: Date(), bytes: result.bytes)
-            dirHistory[dir.url.path, default: []].append(sample)
-            pruneHistory(of: &dirHistory[dir.url.path]!)
-        }
-
-        DispatchQueue.main.async {
-            self.onUpdate?()
+            eventStream = nil
+            usingFallback = true
         }
     }
 
@@ -428,13 +389,56 @@ final class DiskActivityTracker {
         queue.async {
             let now = Date()
             for path in paths {
-                if let index = self.trackedDirs.firstIndex(where: { $0.url.path == path
-                    || path.hasPrefix($0.url.path)
+                let normalized = Self.normalize(path)
+                if let index = self.trackedDirs.firstIndex(where: { dir in
+                    let root = Self.normalize(dir.url.path)
+                    return normalized == root || normalized.hasPrefix(root + "/")
                 }) {
                     if self.trackedDirs[index].dirtySince == nil {
                         self.trackedDirs[index].dirtySince = now
                     }
                 }
+            }
+        }
+    }
+
+    // FSEvents reports resolved paths (/private/var/...) while we track the
+    // symlinked form (/var/...); trailing slashes vary too. Normalize both sides.
+    private static func normalize(_ path: String) -> String {
+        var p = path
+        if p.hasPrefix("/private/") {
+            p = String(p.dropFirst("/private".count))
+        }
+        while p.count > 1 && p.hasSuffix("/") {
+            p = String(p.dropLast())
+        }
+        return p
+    }
+
+    // MARK: - Timers
+
+    // Must be called on the state queue, after startEventStream.
+    private func scheduleTimers() {
+        let fallback = usingFallback
+        DispatchQueue.main.async {
+            if !fallback {
+                self.dirtyCheckTimer = Timer.scheduledTimer(
+                    withTimeInterval: self.config.dirtyCheckInterval,
+                    repeats: true
+                ) { [weak self] _ in
+                    guard let self = self else { return }
+                    self.queue.async { self.checkDirtyDirectories() }
+                }
+            }
+
+            let passInterval =
+                fallback ? self.config.fallbackPassInterval : self.config.fullPassInterval
+            self.fullPassTimer = Timer.scheduledTimer(
+                withTimeInterval: passInterval,
+                repeats: true
+            ) { [weak self] _ in
+                guard let self = self else { return }
+                self.queue.async { self.performFullPass() }
             }
         }
     }
