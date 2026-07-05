@@ -1,20 +1,29 @@
 import Foundation
 
 struct DiskUtils {
-    static func getFreeDiskSpace() -> String {
+    static func getFreeDiskSpaceBytes() -> Int64? {
         let fileURL = URL(fileURLWithPath: "/")
         do {
             let values = try fileURL.resourceValues(forKeys: [
                 .volumeAvailableCapacityForImportantUsageKey
             ])
             if let capacity = values.volumeAvailableCapacityForImportantUsage {
-                let gb = Double(capacity) / 1_000_000_000
-                return String(format: "%.1f GB", gb)
+                return Int64(capacity)
             }
         } catch {
             print("Error retrieving disk space: \(error)")
         }
-        return "N/A"
+        return nil
+    }
+
+    static func formatGB(_ bytes: Int64) -> String {
+        let gb = Double(bytes) / 1_000_000_000
+        return String(format: "%.1f GB", gb)
+    }
+
+    static func getFreeDiskSpace() -> String {
+        guard let bytes = getFreeDiskSpaceBytes() else { return "N/A" }
+        return formatGB(bytes)
     }
 
     static func getTrashAndPurgeableSize() -> String {

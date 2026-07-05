@@ -16,6 +16,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         setupMenu()
+        DiskActivityTracker.shared.start()
         updateDiskSpace()
 
         // Update every 60 seconds
@@ -53,14 +54,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Update the menu item text when the menu is about to open
         menu.delegate = self
+
+        DiskActivityTracker.shared.onUpdate = { [weak self] in
+            guard let self = self else { return }
+            self.rebuildActivityItems()
+        }
     }
 
     @objc func updateDiskSpace() {
-        let freeSpace = DiskUtils.getFreeDiskSpace()
+        guard let bytes = DiskUtils.getFreeDiskSpaceBytes() else { return }
+        let tracker = DiskActivityTracker.shared
+        tracker.recordFreeSpace(bytes: bytes)
+        let delta = tracker.shouldShowMenuBarArrow() ? tracker.freeSpaceDelta() : nil
+        let text = DiskUtils.formatGB(bytes)
         DispatchQueue.main.async {
-            if let button = self.statusItem.button {
-                button.title = freeSpace
-            }
+            guard let button = self.statusItem.button else { return }
+            button.attributedTitle = Self.tickerTitle(text: text, delta: delta)
         }
     }
 
@@ -88,6 +97,117 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         DownloadsMonitor.shared.openDownloadsFolder()
     }
 
+    static func tickerTitle(text: String, delta: Int64?) -> NSAttributedString {
+        let attributed = NSMutableAttributedString()
+
+        if let delta = delta {
+            let arrow = delta > 0 ? "▲ " : "▼ "
+            let color: NSColor = delta > 0 ? .systemGreen : .systemRed
+            let arrowAttr = NSAttributedString(
+                string: arrow,
+                attributes: [
+                    .foregroundColor: color,
+                    .font: NSFont.menuBarFont(ofSize: 0),
+                ]
+            )
+            attributed.append(arrowAttr)
+        }
+
+        let textAttr = NSAttributedString(
+            string: text,
+            attributes: [.font: NSFont.menuBarFont(ofSize: 0)]
+        )
+        attributed.append(textAttr)
+
+        return attributed
+    }
+
+    static func activityRowTitle(name: String, deltaBytes: Int64) -> NSAttributedString {
+        let attributed = NSMutableAttributedString()
+
+        let nameAttr = NSAttributedString(
+            string: name + " — ",
+            attributes: [
+                .foregroundColor: NSColor.labelColor,
+                .font: NSFont.menuFont(ofSize: 0),
+            ]
+        )
+        attributed.append(nameAttr)
+
+        let arrow = deltaBytes > 0 ? "▲ " : "▼ "
+        let color: NSColor = deltaBytes > 0 ? .systemRed : .systemGreen
+        let amount = DiskUtils.formatGB(abs(deltaBytes))
+
+        let amountAttr = NSAttributedString(
+            string: arrow + amount,
+            attributes: [
+                .foregroundColor: color,
+                .font: NSFont.menuFont(ofSize: 0),
+            ]
+        )
+        attributed.append(amountAttr)
+
+        return attributed
+    }
+
+    func rebuildActivityItems() {
+        guard let menu = statusItem.menu else { return }
+        for item in menu.items where (90...110).contains(item.tag) { menu.removeItem(item) }
+        guard let anchor = menu.items.firstIndex(where: { $0.tag == 3 }) else { return }
+        var idx = anchor + 1
+
+        let sep = NSMenuItem.separator()
+        sep.tag = 90
+        menu.insertItem(sep, at: idx)
+        idx += 1
+
+        let header = NSMenuItem(title: "Activity — Last Hour", action: nil, keyEquivalent: "")
+        header.tag = 91
+        header.isEnabled = false
+        menu.insertItem(header, at: idx)
+        idx += 1
+
+        switch DiskActivityTracker.shared.topMovers() {
+        case nil:
+            let placeholder = NSMenuItem(title: "Gathering data…", action: nil, keyEquivalent: "")
+            placeholder.tag = 92
+            placeholder.isEnabled = false
+            menu.insertItem(placeholder, at: idx)
+        case let entries? where entries.isEmpty:
+            let placeholder = NSMenuItem(title: "No significant activity", action: nil, keyEquivalent: "")
+            placeholder.tag = 92
+            placeholder.isEnabled = false
+            menu.insertItem(placeholder, at: idx)
+        case let entries?:
+            var tag = 100
+            for entry in entries {
+                switch entry {
+                case .directory(let url, let name, let delta):
+                    let item = NSMenuItem(title: "", action: #selector(openActivityDirectory(_:)), keyEquivalent: "")
+                    item.tag = tag
+                    tag += 1
+                    item.target = self
+                    item.representedObject = url
+                    item.attributedTitle = Self.activityRowTitle(name: name, deltaBytes: delta)
+                    menu.insertItem(item, at: idx)
+                    idx += 1
+                case .remainder(let delta):
+                    let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+                    item.tag = 93
+                    item.isEnabled = false
+                    item.attributedTitle = Self.activityRowTitle(name: "System & other", deltaBytes: delta)
+                    menu.insertItem(item, at: idx)
+                    idx += 1
+                }
+            }
+        }
+    }
+
+    @objc func openActivityDirectory(_ sender: NSMenuItem) {
+        guard let url = sender.representedObject as? URL else { return }
+        NSWorkspace.shared.open(url)
+    }
+
     func updateTrashMenuItem() {
         guard let menu = statusItem.menu, let item = menu.item(withTag: 1) else { return }
         let size = DiskUtils.getTrashAndPurgeableSize()
@@ -100,6 +220,7 @@ extension AppDelegate: NSMenuDelegate {
         updateTrashMenuItem()
         updateRestartSavingsItem()
         updateDownloadsItem()
+        rebuildActivityItems()
     }
 
     func updateRestartSavingsItem() {
