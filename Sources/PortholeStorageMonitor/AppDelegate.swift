@@ -46,19 +46,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let trashItem = NSMenuItem(
             title: "Calculating...", action: #selector(showEmptyTrashAlert), keyEquivalent: "")
         trashItem.tag = 1
+        trashItem.toolTip =
+            "Combined size of Trash and macOS purgeable space (local Time Machine snapshots and other system-managed data). Click to empty Trash and purgeable space."
         menu.addItem(trashItem)
 
         let restartSavingsItem = NSMenuItem(
             title: "Restart Savings — Calculating...", action: nil, keyEquivalent: "")
         restartSavingsItem.tag = 2
         restartSavingsItem.isEnabled = false  // Informational only
+        restartSavingsItem.toolTip =
+            "Estimated space a restart would free: old system caches, temp files, OS update payloads, and saved app state that are safe to clear after a reboot. This is a different, narrower estimate than Trash + Purgeable above."
         menu.addItem(restartSavingsItem)
-
-        let downloadsItem = NSMenuItem(
-            title: "Downloads — Calculating...", action: #selector(openDownloadsFolder),
-            keyEquivalent: "")
-        downloadsItem.tag = 3
-        menu.addItem(downloadsItem)
 
         menu.addItem(NSMenuItem.separator())
         menu.addItem(
@@ -107,10 +105,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 self.updateDiskSpace()
             }
         }
-    }
-
-    @objc func openDownloadsFolder() {
-        DownloadsMonitor.shared.openDownloadsFolder()
     }
 
     static func tickerTitle(text: String, delta: Int64?) -> NSAttributedString {
@@ -171,7 +165,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func rebuildActivityItems() {
         guard let menu = statusItem.menu else { return }
         for item in menu.items where (90...110).contains(item.tag) { menu.removeItem(item) }
-        guard let anchor = menu.items.firstIndex(where: { $0.tag == 3 }) else { return }
+        guard let anchor = menu.items.firstIndex(where: { $0.tag == 2 }) else { return }
         var idx = anchor + 1
 
         let sep = NSMenuItem.separator()
@@ -182,6 +176,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let header = NSMenuItem(title: "Activity — Last Hour", action: nil, keyEquivalent: "")
         header.tag = 91
         header.isEnabled = false
+        header.toolTip =
+            "Net change in folder sizes over the last hour, ranked by size. Red means a folder grew (using space); green means it shrank (freeing space)."
         menu.insertItem(header, at: idx)
         idx += 1
 
@@ -190,11 +186,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let placeholder = NSMenuItem(title: "Gathering data…", action: nil, keyEquivalent: "")
             placeholder.tag = 92
             placeholder.isEnabled = false
+            placeholder.toolTip =
+                "Porthole needs a bit more history before it can show hourly changes. Check back shortly."
             menu.insertItem(placeholder, at: idx)
         case let entries? where entries.isEmpty:
             let placeholder = NSMenuItem(title: "No significant activity", action: nil, keyEquivalent: "")
             placeholder.tag = 92
             placeholder.isEnabled = false
+            placeholder.toolTip =
+                "No tracked folder changed by more than 100 MB in the last hour."
             menu.insertItem(placeholder, at: idx)
         case let entries?:
             var tag = 100
@@ -207,6 +207,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     item.target = self
                     item.representedObject = url
                     item.attributedTitle = Self.activityRowTitle(name: name, deltaBytes: delta)
+                    let direction = delta > 0 ? "grew" : "shrank"
+                    item.toolTip =
+                        "\(name) \(direction) by \(DiskUtils.formatGB(abs(delta))) in the last hour. Click to open this folder in Finder."
                     menu.insertItem(item, at: idx)
                     idx += 1
                 case .remainder(let delta):
@@ -214,6 +217,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     item.tag = 93
                     item.isEnabled = false
                     item.attributedTitle = Self.activityRowTitle(name: "System & other", deltaBytes: delta)
+                    item.toolTip =
+                        "Estimated change across everything not individually tracked (e.g. app support files, system data) over the last hour."
                     menu.insertItem(item, at: idx)
                     idx += 1
                 }
@@ -229,7 +234,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func updateTrashMenuItem() {
         guard let menu = statusItem.menu, let item = menu.item(withTag: 1) else { return }
         let size = DiskUtils.getTrashAndPurgeableSize()
-        item.title = "Trash + Purgeable: \(size)"
+        item.title = "Trash + Purgeable — \(size)"
     }
 }
 
@@ -237,7 +242,6 @@ extension AppDelegate: NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         updateTrashMenuItem()
         updateRestartSavingsItem()
-        updateDownloadsItem()
         rebuildActivityItems()
     }
 
@@ -255,22 +259,6 @@ extension AppDelegate: NSMenuDelegate {
                     let item = menu.item(withTag: 2)
                 else { return }
                 item.title = "Restart Savings — \(newValue)"
-            }
-        }
-    }
-
-    func updateDownloadsItem() {
-        guard let menu = statusItem.menu, let item = menu.item(withTag: 3) else { return }
-
-        let size = DownloadsMonitor.shared.getDownloadsSize()
-        item.title = "Downloads — \(size)"
-
-        DownloadsMonitor.shared.onUpdate = { [weak self] newValue in
-            DispatchQueue.main.async {
-                guard let self = self, let menu = self.statusItem.menu,
-                    let item = menu.item(withTag: 3)
-                else { return }
-                item.title = "Downloads — \(newValue)"
             }
         }
     }
