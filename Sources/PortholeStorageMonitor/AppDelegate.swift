@@ -12,10 +12,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if let button = statusItem.button {
             button.image = Self.makeMenuBarIcon()
             button.imagePosition = .imageRight
-            button.imageEdgeInsets = NSEdgeInsets(top: 0, left: 4, bottom: 0, right: 0)
         }
 
         setupMenu()
+        DiskActivityTracker.shared.start()
         updateDiskSpace()
 
         // Update every 60 seconds
@@ -46,19 +46,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let trashItem = NSMenuItem(
             title: "Calculating...", action: #selector(showEmptyTrashAlert), keyEquivalent: "")
         trashItem.tag = 1
+        trashItem.toolTip =
+            "Combined size of Trash and macOS purgeable space (local Time Machine snapshots and other system-managed data). Click to empty Trash and purgeable space."
         menu.addItem(trashItem)
 
         let restartSavingsItem = NSMenuItem(
             title: "Restart Savings — Calculating...", action: nil, keyEquivalent: "")
         restartSavingsItem.tag = 2
         restartSavingsItem.isEnabled = false  // Informational only
+        restartSavingsItem.toolTip =
+            "Estimated space a restart would free: old system caches, temp files, OS update payloads, and saved app state that are safe to clear after a reboot. This is a different, narrower estimate than Trash + Purgeable above."
         menu.addItem(restartSavingsItem)
-
-        let downloadsItem = NSMenuItem(
-            title: "Downloads — Calculating...", action: #selector(openDownloadsFolder),
-            keyEquivalent: "")
-        downloadsItem.tag = 3
-        menu.addItem(downloadsItem)
 
         menu.addItem(NSMenuItem.separator())
         menu.addItem(
@@ -69,15 +67,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Update the menu item text when the menu is about to open
         menu.delegate = self
+
+        DiskActivityTracker.shared.onUpdate = { [weak self] in
+            guard let self = self else { return }
+            self.rebuildActivityItems()
+        }
     }
 
     @objc func updateDiskSpace() {
-        let freeSpace = DiskUtils.getFreeDiskSpace()
-        let numberOnly = freeSpace.replacingOccurrences(of: " GB", with: "")
+        guard let bytes = DiskUtils.getFreeDiskSpaceBytes() else { return }
+        let tracker = DiskActivityTracker.shared
+        tracker.recordFreeSpace(bytes: bytes)
+        let delta = tracker.shouldShowMenuBarArrow() ? tracker.freeSpaceDelta() : nil
+        // Number only — the "GB" label lives inside the compact drive icon.
+        let text = DiskUtils.formatGB(bytes).replacingOccurrences(of: " GB", with: "")
         DispatchQueue.main.async {
-            if let button = self.statusItem.button {
-                button.title = numberOnly
-            }
+            guard let button = self.statusItem.button else { return }
+            button.attributedTitle = Self.tickerTitle(text: text, delta: delta)
         }
     }
 
@@ -101,14 +107,134 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    @objc func openDownloadsFolder() {
-        DownloadsMonitor.shared.openDownloadsFolder()
+    static func tickerTitle(text: String, delta: Int64?) -> NSAttributedString {
+        let attributed = NSMutableAttributedString()
+
+        if let delta = delta {
+            let arrow = delta > 0 ? "▲ " : "▼ "
+            let color: NSColor = delta > 0 ? .systemGreen : .systemRed
+            let arrowAttr = NSAttributedString(
+                string: arrow,
+                attributes: [
+                    .foregroundColor: color,
+                    .font: NSFont.menuBarFont(ofSize: 0),
+                ]
+            )
+            attributed.append(arrowAttr)
+        }
+
+        // Thin space keeps a small gap between the number and the drive icon,
+        // which sits to the right of the title (imagePosition = .imageRight).
+        let textAttr = NSAttributedString(
+            string: text + "\u{2009}",
+            attributes: [.font: NSFont.menuBarFont(ofSize: 0)]
+        )
+        attributed.append(textAttr)
+
+        return attributed
+    }
+
+    static func activityRowTitle(name: String, deltaBytes: Int64) -> NSAttributedString {
+        let attributed = NSMutableAttributedString()
+
+        let nameAttr = NSAttributedString(
+            string: name + " — ",
+            attributes: [
+                .foregroundColor: NSColor.labelColor,
+                .font: NSFont.menuFont(ofSize: 0),
+            ]
+        )
+        attributed.append(nameAttr)
+
+        let arrow = deltaBytes > 0 ? "▲ " : "▼ "
+        let color: NSColor = deltaBytes > 0 ? .systemRed : .systemGreen
+        let amount = DiskUtils.formatGB(abs(deltaBytes))
+
+        let amountAttr = NSAttributedString(
+            string: arrow + amount,
+            attributes: [
+                .foregroundColor: color,
+                .font: NSFont.menuFont(ofSize: 0),
+            ]
+        )
+        attributed.append(amountAttr)
+
+        return attributed
+    }
+
+    func rebuildActivityItems() {
+        guard let menu = statusItem.menu else { return }
+        for item in menu.items where (90...110).contains(item.tag) { menu.removeItem(item) }
+        guard let anchor = menu.items.firstIndex(where: { $0.tag == 2 }) else { return }
+        var idx = anchor + 1
+
+        let sep = NSMenuItem.separator()
+        sep.tag = 90
+        menu.insertItem(sep, at: idx)
+        idx += 1
+
+        let header = NSMenuItem(title: "Activity — Last Hour", action: nil, keyEquivalent: "")
+        header.tag = 91
+        header.isEnabled = false
+        header.toolTip =
+            "Net change in folder sizes over the last hour, ranked by size. Red means a folder grew (using space); green means it shrank (freeing space)."
+        menu.insertItem(header, at: idx)
+        idx += 1
+
+        switch DiskActivityTracker.shared.topMovers() {
+        case nil:
+            let placeholder = NSMenuItem(title: "Gathering data…", action: nil, keyEquivalent: "")
+            placeholder.tag = 92
+            placeholder.isEnabled = false
+            placeholder.toolTip =
+                "Porthole needs a bit more history before it can show hourly changes. Check back shortly."
+            menu.insertItem(placeholder, at: idx)
+        case let entries? where entries.isEmpty:
+            let placeholder = NSMenuItem(title: "No significant activity", action: nil, keyEquivalent: "")
+            placeholder.tag = 92
+            placeholder.isEnabled = false
+            placeholder.toolTip =
+                "No tracked folder changed by more than 100 MB in the last hour."
+            menu.insertItem(placeholder, at: idx)
+        case let entries?:
+            var tag = 100
+            for entry in entries {
+                switch entry {
+                case .directory(let url, let name, let delta):
+                    let item = NSMenuItem(title: "", action: #selector(openActivityDirectory(_:)), keyEquivalent: "")
+                    item.tag = tag
+                    tag += 1
+                    item.target = self
+                    item.representedObject = url
+                    item.attributedTitle = Self.activityRowTitle(name: name, deltaBytes: delta)
+                    let direction = delta > 0 ? "grew" : "shrank"
+                    item.toolTip =
+                        "\(name) \(direction) by \(DiskUtils.formatGB(abs(delta))) in the last hour. Click to open this folder in Finder."
+                    menu.insertItem(item, at: idx)
+                    idx += 1
+                case .remainder(let delta):
+                    let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+                    item.tag = 93
+                    item.isEnabled = false
+                    item.attributedTitle = Self.activityRowTitle(name: "System & other", deltaBytes: delta)
+                    item.toolTip =
+                        "Estimated change across everything not individually tracked (e.g. app support files, system data) over the last hour."
+                    menu.insertItem(item, at: idx)
+                    idx += 1
+                }
+            }
+        }
+    }
+
+    @objc func openActivityDirectory(_ sender: NSMenuItem) {
+        guard let url = sender.representedObject as? URL else { return }
+        NSWorkspace.shared.open(url)
     }
 
     func updateTrashMenuItem() {
         guard let menu = statusItem.menu, let item = menu.item(withTag: 1) else { return }
         let size = DiskUtils.getTrashAndPurgeableSize()
-        item.title = "Trash + Purgeable: \(size)"
+        item.title = "Trash + Purgeable — \(size)"
     }
 }
 
@@ -116,7 +242,7 @@ extension AppDelegate: NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         updateTrashMenuItem()
         updateRestartSavingsItem()
-        updateDownloadsItem()
+        rebuildActivityItems()
     }
 
     func updateRestartSavingsItem() {
@@ -133,22 +259,6 @@ extension AppDelegate: NSMenuDelegate {
                     let item = menu.item(withTag: 2)
                 else { return }
                 item.title = "Restart Savings — \(newValue)"
-            }
-        }
-    }
-
-    func updateDownloadsItem() {
-        guard let menu = statusItem.menu, let item = menu.item(withTag: 3) else { return }
-
-        let size = DownloadsMonitor.shared.getDownloadsSize()
-        item.title = "Downloads — \(size)"
-
-        DownloadsMonitor.shared.onUpdate = { [weak self] newValue in
-            DispatchQueue.main.async {
-                guard let self = self, let menu = self.statusItem.menu,
-                    let item = menu.item(withTag: 3)
-                else { return }
-                item.title = "Downloads — \(newValue)"
             }
         }
     }
