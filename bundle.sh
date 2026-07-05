@@ -22,6 +22,12 @@ cp ".build/release/${EXECUTABLE_NAME}" "${APP_BUNDLE}/Contents/MacOS/"
 echo "Copying Menu Bar Icon..."
 cp "Sources/PortholeStorageMonitor/Resources/CompactIcon.png" "${APP_BUNDLE}/Contents/Resources/"
 
+echo "Incrementing Build Number..."
+CURRENT_BUILD=$(plutil -extract CFBundleVersion raw Info.plist)
+NEW_BUILD=$((CURRENT_BUILD + 1))
+plutil -replace CFBundleVersion -string "${NEW_BUILD}" Info.plist
+echo "Build number: ${CURRENT_BUILD} -> ${NEW_BUILD}"
+
 echo "Copying Info.plist..."
 cp "Info.plist" "${APP_BUNDLE}/Contents/"
 
