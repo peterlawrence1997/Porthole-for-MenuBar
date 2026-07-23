@@ -2,6 +2,10 @@ import Cocoa
 import SwiftUI
 
 class AppDelegate: NSObject, NSApplicationDelegate {
+    private static let daisyDiskURL = URL(fileURLWithPath: "/Applications/DaisyDisk.app")
+    private static let storageSettingsURL = URL(
+        string: "x-apple.systempreferences:com.apple.settings.Storage")!
+
     var statusItem: NSStatusItem!
     var timer: Timer?
 
@@ -57,6 +61,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         restartSavingsItem.toolTip =
             "Estimated space a restart would free: old system caches, temp files, OS update payloads, and saved app state that are safe to clear after a reboot. This is a different, narrower estimate than Trash + Purgeable above."
         menu.addItem(restartSavingsItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        let diskUsageToolItem = NSMenuItem(
+            title: "", action: #selector(openDiskUsageTool), keyEquivalent: "")
+        diskUsageToolItem.tag = 3
+        diskUsageToolItem.target = self
+        menu.addItem(diskUsageToolItem)
+        updateDiskUsageToolMenuItem(diskUsageToolItem)
 
         menu.addItem(NSMenuItem.separator())
         menu.addItem(
@@ -231,6 +244,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.open(url)
     }
 
+    @objc func openDiskUsageTool() {
+        if FileManager.default.fileExists(atPath: Self.daisyDiskURL.path) {
+            NSWorkspace.shared.open(Self.daisyDiskURL)
+        } else {
+            NSWorkspace.shared.open(Self.storageSettingsURL)
+        }
+    }
+
+    func updateDiskUsageToolMenuItem(_ item: NSMenuItem? = nil) {
+        guard let item = item ?? statusItem.menu?.item(withTag: 3) else { return }
+
+        if FileManager.default.fileExists(atPath: Self.daisyDiskURL.path) {
+            item.title = "Open DaisyDisk"
+            item.toolTip = "Launch DaisyDisk to inspect disk usage."
+        } else {
+            item.title = "Open Storage Settings"
+            item.toolTip = "Open macOS Storage Settings to inspect disk usage."
+        }
+    }
+
     func updateTrashMenuItem() {
         guard let menu = statusItem.menu, let item = menu.item(withTag: 1) else { return }
         let size = DiskUtils.getTrashAndPurgeableSize()
@@ -242,6 +275,7 @@ extension AppDelegate: NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         updateTrashMenuItem()
         updateRestartSavingsItem()
+        updateDiskUsageToolMenuItem()
         rebuildActivityItems()
     }
 
