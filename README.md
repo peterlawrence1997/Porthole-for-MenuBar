@@ -1,8 +1,17 @@
 # Porthole - Storage Monitor
 
-A simple macOS menu bar application that displays your available disk space.
+A simple macOS menu bar application that displays available disk space and RAM usage.
 
 ## Features
+
+- Shows available disk space and RAM used in the menu bar, alternating once per minute.
+- Hover over the menu bar item to temporarily peek at the other metric.
+- Keeps disk space, RAM used/total, and macOS memory pressure visible together in the menu.
+- Opens DaisyDisk from the menu when installed, or macOS Storage Settings otherwise.
+
+RAM used is estimated from active, wired, and compressed memory. Memory pressure is the
+system's current Normal, Warning, or Critical level; it is not the percentage of RAM used.
+
 ## How to Install
 
 Since this is a custom app shared directly, you'll need to build it once on your machine. Don't worry, it's automated!

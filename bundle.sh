@@ -1,11 +1,12 @@
 #!/bin/bash
+set -e
 
 # Set TMPDIR to a known valid location to avoid Swift compiler issues in some environments
 export TMPDIR="/tmp"
 
 APP_NAME="Porthole - Storage Monitor"
 EXECUTABLE_NAME="PortholeStorageMonitor"
-APP_BUNDLE="${APP_NAME}.app"
+APP_BUNDLE="${PORTHOLE_BUNDLE_OUTPUT_DIR:-.}/${APP_NAME}.app"
 ICON_SCRIPT="generate_icon.swift"
 
 echo "Building ${APP_NAME}..."
@@ -21,6 +22,7 @@ cp ".build/release/${EXECUTABLE_NAME}" "${APP_BUNDLE}/Contents/MacOS/"
 
 echo "Copying Menu Bar Icon..."
 cp "Sources/PortholeStorageMonitor/Resources/CompactIcon.png" "${APP_BUNDLE}/Contents/Resources/"
+cp "Sources/PortholeStorageMonitor/Resources/CompactRAMIcon.png" "${APP_BUNDLE}/Contents/Resources/"
 
 echo "Incrementing Build Number..."
 CURRENT_BUILD=$(plutil -extract CFBundleVersion raw Info.plist)

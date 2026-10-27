@@ -23,7 +23,8 @@ if ! command -v swift &> /dev/null; then
 fi
 
 echo "Building and Packaging..."
-./bundle.sh
+STAGING_DIR="$(mktemp -d /private/tmp/porthole-install.XXXXXX)"
+PORTHOLE_BUNDLE_OUTPUT_DIR="$STAGING_DIR" ./bundle.sh
 
 if [ $? -ne 0 ]; then
     echo "Error: Build failed."
@@ -36,6 +37,13 @@ echo "Build successful!"
 echo ""
 
 APP_NAME="Porthole - Storage Monitor.app"
+BUILT_APP="$STAGING_DIR/$APP_NAME"
+
+if ! codesign --verify --deep "$BUILT_APP"; then
+    echo "Error: The packaged app did not pass signature verification."
+    read -p "Press Enter to exit..."
+    exit 1
+fi
 
 # Ask to move to Applications
 read -p "Do you want to move the app to your Applications folder? (y/n) " -n 1 -r
@@ -43,14 +51,26 @@ echo ""
 if [[ $REPLY =~ ^[Yy]$ ]]
 then
     echo "Moving to /Applications..."
-    # Remove existing if present
+    BACKUP_APP="$STAGING_DIR/previous-$APP_NAME"
     if [ -d "/Applications/${APP_NAME}" ]; then
-        rm -rf "/Applications/${APP_NAME}"
+        if ! mv "/Applications/${APP_NAME}" "$BACKUP_APP"; then
+            echo "Error: Could not move the previous app out of /Applications."
+            exit 1
+        fi
     fi
-    mv "${APP_NAME}" /Applications/
+    if ! mv "$BUILT_APP" /Applications/; then
+        echo "Error: Could not install the new app."
+        if [ -d "$BACKUP_APP" ]; then
+            mv "$BACKUP_APP" "/Applications/${APP_NAME}"
+        fi
+        exit 1
+    fi
     echo "Done! You can now find Porthole in your Applications folder."
+    if [ -d "$BACKUP_APP" ]; then
+        echo "The previous version is backed up at: $BACKUP_APP"
+    fi
 else
-    echo "Okay, the app is located in this folder: ${DIR}/${APP_NAME}"
+    echo "Okay, the app is located at: $BUILT_APP"
 fi
 
 echo ""

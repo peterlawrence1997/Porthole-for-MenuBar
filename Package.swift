@@ -14,7 +14,8 @@ let package = Package(
         .executableTarget(
             name: "PortholeStorageMonitor",
             resources: [
-                .copy("Resources/CompactIcon.png")
+                .copy("Resources/CompactIcon.png"),
+                .copy("Resources/CompactRAMIcon.png")
             ])
     ]
 )
