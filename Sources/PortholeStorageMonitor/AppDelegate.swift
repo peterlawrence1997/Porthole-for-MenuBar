@@ -3,6 +3,8 @@ import QuartzCore
 import SwiftUI
 
 class AppDelegate: NSObject, NSApplicationDelegate {
+    private static var mainColumnEdge: CGFloat = 220
+    private static var lockedColumnEdges: [ObjectIdentifier: CGFloat] = [:]
     private static let daisyDiskURL = URL(fileURLWithPath: "/Applications/DaisyDisk.app")
     private static let storageSettingsURL = URL(
         string: "x-apple.systempreferences:com.apple.settings.Storage")!
@@ -16,6 +18,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var diskDelta: Int64?
     private var memorySnapshot: MemorySnapshot?
     private var memoryHistory: [(date: Date, usedBytes: UInt64)] = []
+    private var processMemoryMenu: NSMenu?
+    private var isRefreshingProcesses = false
     private var showingMemory = false
     private var isHoveringStatusItem = false
     private var hoverShowingMemory: Bool?
@@ -75,20 +79,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         menu.autoenablesItems = false
 
-        let diskItem = NSMenuItem(title: "Disk Available — Calculating…", action: nil, keyEquivalent: "")
+        let diskItem = NSMenuItem(title: "Disk Available", action: nil, keyEquivalent: "")
         diskItem.tag = 4
+        diskItem.attributedTitle = Self.menuColumns(label: "Disk Available", value: "Calculating…")
         diskItem.image = Self.menuSymbol("internaldrive", description: "Disk")
         diskItem.toolTip = "Free space on the startup disk. The arrow shows whether available space has risen or fallen over the last hour; this is not the same as total disk activity."
         menu.addItem(diskItem)
 
-        let memoryItem = NSMenuItem(title: "RAM Used — Calculating…", action: nil, keyEquivalent: "")
+        let memoryItem = NSMenuItem(title: "RAM Used", action: nil, keyEquivalent: "")
         memoryItem.tag = 5
+        memoryItem.attributedTitle = Self.menuColumns(label: "RAM Used", value: "Calculating…")
         memoryItem.image = Self.menuSymbol("memorychip", description: "Memory")
         memoryItem.toolTip = "Active, wired, and compressed memory in use. macOS can reclaim inactive and cached memory as needed. The arrow compares readings from the last 10 minutes."
+        let processMenu = NSMenu(title: "Top RAM Processes")
+        processMenu.autoenablesItems = false
+        processMenu.addItem(NSMenuItem(
+            title: "Gathering process memory…", action: nil, keyEquivalent: ""))
+        memoryItem.submenu = processMenu
+        processMemoryMenu = processMenu
         menu.addItem(memoryItem)
 
-        let pressureItem = NSMenuItem(title: "Memory Pressure — Calculating…", action: nil, keyEquivalent: "")
+        let pressureItem = NSMenuItem(title: "Memory Pressure", action: nil, keyEquivalent: "")
         pressureItem.tag = 6
+        pressureItem.attributedTitle = Self.menuColumns(label: "Memory Pressure", value: "Calculating…")
         pressureItem.image = Self.menuSymbol("waveform.path.ecg", description: "Memory pressure")
         pressureItem.toolTip = "Memory pressure reflects how comfortably macOS can meet memory demand; it is more useful than RAM usage alone."
         menu.addItem(pressureItem)
@@ -96,15 +109,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem.separator())
 
         let trashItem = NSMenuItem(
-            title: "Calculating...", action: #selector(showEmptyTrashAlert), keyEquivalent: "")
+            title: "Trash + Purgeable", action: #selector(showEmptyTrashAlert), keyEquivalent: "")
         trashItem.tag = 1
+        trashItem.attributedTitle = Self.menuColumns(label: "Trash + Purgeable", value: "Calculating…")
         trashItem.toolTip =
             "Combined size of Trash and macOS purgeable space (local Time Machine snapshots and other system-managed data). Click to empty Trash and purgeable space."
         menu.addItem(trashItem)
 
         let restartSavingsItem = NSMenuItem(
-            title: "Restart Savings — Calculating...", action: nil, keyEquivalent: "")
+            title: "Restart Savings", action: nil, keyEquivalent: "")
         restartSavingsItem.tag = 2
+        restartSavingsItem.attributedTitle = Self.menuColumns(label: "Restart Savings", value: "Calculating…")
         restartSavingsItem.image = Self.menuSymbol("arrow.clockwise", description: "Restart")
         restartSavingsItem.toolTip =
             "Estimated space a restart would free: old system caches, temp files, OS update payloads, and saved app state that are safe to clear after a reboot. This is a different, narrower estimate than Trash + Purgeable above."
@@ -122,12 +137,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem.separator())
         menu.addItem(
             NSMenuItem(
-                title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+                title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: ""))
 
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "—"
         let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "—"
         let credit = NSMenuItem(
-            title: "Porthole v\(version) (\(build)) · by Peter Lawrence", action: nil,
+            title: "Porthole v\(version) (\(build))", action: nil,
             keyEquivalent: "")
         credit.image = Self.menuSymbol("info.circle", description: "About Porthole")
         credit.attributedTitle = NSAttributedString(
@@ -160,7 +175,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let freeDelta = tracker.freeSpaceDelta()
         Self.setTrendTitle(
             on: statusItem.menu?.item(withTag: 4),
-            text: "Disk Available — \(DiskUtils.formatGB(bytes))",
+            label: "Disk Available", value: DiskUtils.formatGB(bytes),
             delta: freeDelta, risingIsGood: true)
         statusItem.menu?.item(withTag: 4)?.toolTip =
             "Free space on the startup disk. "
@@ -174,10 +189,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if let snapshot = memorySnapshot {
             recordMemory(usedBytes: snapshot.usedBytes)
             let used = MemoryUtils.formatGB(snapshot.usedBytes)
-            let total = MemoryUtils.formatGB(snapshot.totalBytes)
+            let total = MemoryUtils.formatCapacity(snapshot.totalBytes)
             Self.setTrendTitle(
                 on: statusItem.menu?.item(withTag: 5),
-                text: "RAM Used — \(used) / \(total) (\(snapshot.usedPercentage)%)",
+                label: "RAM Used",
+                value: "\(used) / \(total)",
                 delta: memoryDelta(), risingIsGood: false)
             statusItem.menu?.item(withTag: 5)?.toolTip =
                 "Active, wired, and compressed RAM in use; cached RAM is reclaimable. "
@@ -187,8 +203,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             Self.setPressureTitle(on: statusItem.menu?.item(withTag: 6), pressure: snapshot.pressure)
             statusItem.menu?.item(withTag: 6)?.toolTip = Self.pressureExplanation(snapshot.pressure)
         } else {
-            statusItem.menu?.item(withTag: 5)?.title = "RAM Used — Unavailable"
-            statusItem.menu?.item(withTag: 6)?.title = "Memory Pressure — Unavailable"
+            statusItem.menu?.item(withTag: 5)?.attributedTitle =
+                Self.menuColumns(label: "RAM Used", value: "Unavailable")
+            statusItem.menu?.item(withTag: 6)?.attributedTitle =
+                Self.menuColumns(label: "Memory Pressure", value: "Unavailable")
         }
         refreshStatusItem()
     }
@@ -211,18 +229,81 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return Int64(newest.usedBytes) - Int64(baseline.usedBytes)
     }
 
-    private static func setTrendTitle(
-        on item: NSMenuItem?, text: String, delta: Int64?, risingIsGood: Bool
-    ) {
-        guard let item else { return }
+    private static func menuColumns(
+        label: String, value: String, valueColor: NSColor = .labelColor,
+        rightEdge: CGFloat? = nil
+    ) -> NSMutableAttributedString {
+        let style = NSMutableParagraphStyle()
+        style.tabStops = [NSTextTab(textAlignment: .right, location: rightEdge ?? mainColumnEdge, options: [:])]
+        style.defaultTabInterval = 0
+        style.lineBreakMode = .byTruncatingMiddle
         let font = NSFont.menuFont(ofSize: 0)
         let title = NSMutableAttributedString(
-            string: text, attributes: [.font: font, .foregroundColor: NSColor.labelColor])
+            string: label + "\t",
+            attributes: [
+                .font: font,
+                .foregroundColor: NSColor.labelColor,
+                .paragraphStyle: style,
+            ])
+        title.append(NSAttributedString(
+            string: value,
+            attributes: [
+                .font: font,
+                .foregroundColor: valueColor,
+                .paragraphStyle: style,
+            ]))
+        return title
+    }
+
+    private static func fitColumns(in menu: NSMenu?) {
+        guard let menu else { return }
+        let rows = menu.items.compactMap { item -> (NSMenuItem, NSAttributedString, NSRange)? in
+            guard let title = item.attributedTitle else { return nil }
+            let tab = (title.string as NSString).range(of: "\t")
+            guard tab.location != NSNotFound else { return nil }
+            return (item, title, tab)
+        }
+        // Measure each label/value pair without its tab, preserving fonts.
+        // A common trailing edge aligns values without a fixed-width menu.
+        let measuredEdge = ceil(rows.map { _, title, tab -> CGFloat in
+            let label = title.attributedSubstring(from: NSRange(location: 0, length: tab.location))
+            let value = title.attributedSubstring(from: NSRange(
+                location: tab.location + 1, length: title.length - tab.location - 1))
+            return label.size().width + 20 + value.size().width
+        }.max() ?? 0)
+        let edge = lockedColumnEdges[ObjectIdentifier(menu)] ?? measuredEdge
+        if menu.supermenu == nil { mainColumnEdge = edge }
+        for (item, title, _) in rows {
+            let fitted = NSMutableAttributedString(attributedString: title)
+            let style = NSMutableParagraphStyle()
+            style.tabStops = [NSTextTab(textAlignment: .right, location: edge, options: [:])]
+            style.defaultTabInterval = 0
+            fitted.addAttribute(.paragraphStyle, value: style,
+                                range: NSRange(location: 0, length: fitted.length))
+            item.attributedTitle = fitted
+        }
+    }
+
+    private static func setTrendTitle(
+        on item: NSMenuItem?, label: String, value: String,
+        delta: Int64?, risingIsGood: Bool
+    ) {
+        guard let item else { return }
+        let arrow: String
+        let arrowColor: NSColor
         if let delta, abs(delta) >= 100_000_000 {
-            let arrow = delta > 0 ? "  ↑" : "  ↓"
-            let color: NSColor = (risingIsGood == (delta > 0)) ? .systemGreen : .systemRed
-            title.append(NSAttributedString(
-                string: arrow, attributes: [.font: font, .foregroundColor: color]))
+            arrow = delta > 0 ? "↑ " : "↓ "
+            arrowColor = (risingIsGood == (delta > 0)) ? .systemGreen : .systemRed
+        } else {
+            arrow = ""
+            arrowColor = .labelColor
+        }
+        let title = menuColumns(label: label, value: arrow + value)
+        if !arrow.isEmpty {
+            title.addAttribute(
+                .foregroundColor, value: arrowColor,
+                range: NSRange(location: (label as NSString).length + 1,
+                               length: (arrow as NSString).length))
         }
         item.attributedTitle = title
     }
@@ -244,16 +325,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         case .critical: color = .systemRed
         case .unavailable: color = .secondaryLabelColor
         }
-        let title = NSMutableAttributedString(
-            string: "Memory Pressure — ",
-            attributes: [
-                .font: NSFont.menuFont(ofSize: 0),
-                .foregroundColor: NSColor.labelColor,
-            ])
-        title.append(NSAttributedString(
-            string: pressure.rawValue,
-            attributes: [.font: NSFont.menuFont(ofSize: 0), .foregroundColor: color]))
-        item.attributedTitle = title
+        item.attributedTitle = menuColumns(
+            label: "Memory Pressure", value: pressure.rawValue, valueColor: color)
     }
 
     private static func pressureExplanation(_ pressure: MemorySnapshot.Pressure) -> String {
@@ -277,7 +350,53 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return image
     }
 
+    private func refreshProcessMemoryMenu() {
+        guard !isRefreshingProcesses else { return }
+        isRefreshingProcesses = true
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let entries = ProcessMemoryUtils.topProcesses()
+            DispatchQueue.main.async {
+                guard let self, let menu = self.processMemoryMenu else { return }
+                self.isRefreshingProcesses = false
+                menu.removeAllItems()
+
+                let heading = NSMenuItem(
+                    title: "Highest resident memory", action: nil, keyEquivalent: "")
+                heading.isEnabled = false
+                heading.toolTip =
+                    "Resident memory (RSS) is physical memory currently held by each process. Shared memory can appear in more than one process, so these values do not sum to total RAM used."
+                menu.addItem(heading)
+                menu.addItem(.separator())
+
+                guard let entries else {
+                    menu.addItem(NSMenuItem(
+                        title: "Process details unavailable", action: nil, keyEquivalent: ""))
+                    return
+                }
+                if entries.isEmpty {
+                    menu.addItem(NSMenuItem(
+                        title: "No processes found", action: nil, keyEquivalent: ""))
+                }
+                for entry in entries {
+                    let shortName = String(entry.name.prefix(26))
+                    let item = NSMenuItem(
+                        title: shortName,
+                        action: nil, keyEquivalent: "")
+                    item.attributedTitle = Self.menuColumns(
+                        label: shortName,
+                        value: ProcessMemoryUtils.formatResidentBytes(entry.residentBytes))
+                    item.toolTip =
+                        "\(entry.name) (PID \(entry.pid)): \(ProcessMemoryUtils.formatResidentBytes(entry.residentBytes)) of resident physical memory. Values are a snapshot and may change quickly."
+                    menu.addItem(item)
+                }
+                Self.fitColumns(in: menu)
+            }
+        }
+    }
+
     private func refreshStatusItem() {
+        Self.fitColumns(in: statusItem.menu)
         guard let button = statusItem.button else { return }
         let diskTitle = Self.tickerTitle(text: diskText ?? "—", delta: diskDelta)
         let memoryTitle = memorySnapshot.map { snapshot in
@@ -315,7 +434,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         {
             button.image = memoryIcon
             button.attributedTitle = memoryTitle
-            button.toolTip = "RAM used: \(MemoryUtils.formatGB(snapshot.usedBytes)) of \(MemoryUtils.formatGB(snapshot.totalBytes)) (\(snapshot.usedPercentage)%). \(Self.pressureExplanation(snapshot.pressure))"
+            button.toolTip = "RAM used: \(MemoryUtils.formatGB(snapshot.usedBytes)) of \(MemoryUtils.formatCapacity(snapshot.totalBytes)). \(Self.pressureExplanation(snapshot.pressure))"
         } else {
             button.image = diskIcon
             button.attributedTitle = diskTitle
@@ -387,31 +506,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     static func activityRowTitle(name: String, deltaBytes: Int64) -> NSAttributedString {
-        let attributed = NSMutableAttributedString()
-
-        let nameAttr = NSAttributedString(
-            string: name + " — ",
-            attributes: [
-                .foregroundColor: NSColor.labelColor,
-                .font: NSFont.menuFont(ofSize: 0),
-            ]
-        )
-        attributed.append(nameAttr)
-
         let arrow = deltaBytes > 0 ? "▲ " : "▼ "
         let color: NSColor = deltaBytes > 0 ? .systemRed : .systemGreen
         let amount = DiskUtils.formatGB(abs(deltaBytes))
-
-        let amountAttr = NSAttributedString(
-            string: arrow + amount,
-            attributes: [
-                .foregroundColor: color,
-                .font: NSFont.menuFont(ofSize: 0),
-            ]
-        )
-        attributed.append(amountAttr)
-
-        return attributed
+        return menuColumns(
+            label: String(name.prefix(26)), value: arrow + amount, valueColor: color)
     }
 
     func rebuildActivityItems() {
@@ -425,7 +524,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.insertItem(sep, at: idx)
         idx += 1
 
-        let header = NSMenuItem(title: "Activity — Last Hour", action: nil, keyEquivalent: "")
+        let header = NSMenuItem(title: "Activity (Last Hour)", action: nil, keyEquivalent: "")
         header.tag = 91
         header.isEnabled = false
         header.toolTip =
@@ -506,17 +605,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func updateTrashMenuItem() {
         guard let menu = statusItem.menu, let item = menu.item(withTag: 1) else { return }
         let size = DiskUtils.getTrashAndPurgeableSize()
-        item.title = "Trash + Purgeable — \(size)"
+        item.attributedTitle = Self.menuColumns(label: "Trash + Purgeable", value: size)
     }
 }
 
 extension AppDelegate: NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         updateMemory()
+        refreshProcessMemoryMenu()
         updateTrashMenuItem()
         updateRestartSavingsItem()
         updateDiskUsageToolMenuItem()
         rebuildActivityItems()
+        Self.fitColumns(in: menu)
+        Self.lockedColumnEdges[ObjectIdentifier(menu)] = Self.mainColumnEdge
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        Self.lockedColumnEdges.removeValue(forKey: ObjectIdentifier(menu))
     }
 
     func updateRestartSavingsItem() {
@@ -524,7 +630,7 @@ extension AppDelegate: NSMenuDelegate {
 
         // Get current estimate (returns "Calculating..." or cached value)
         let estimate = RestartSavingsEstimator.shared.getEstimatedSavings()
-        item.title = "Restart Savings — \(estimate)"
+        item.attributedTitle = Self.menuColumns(label: "Restart Savings", value: estimate)
 
         // If it was calculating, the callback will update it later
         RestartSavingsEstimator.shared.onUpdate = { [weak self] newValue in
@@ -532,7 +638,9 @@ extension AppDelegate: NSMenuDelegate {
                 guard let self = self, let menu = self.statusItem.menu,
                     let item = menu.item(withTag: 2)
                 else { return }
-                item.title = "Restart Savings — \(newValue)"
+                item.attributedTitle = Self.menuColumns(
+                    label: "Restart Savings", value: newValue)
+                Self.fitColumns(in: menu)
             }
         }
     }

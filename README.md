@@ -7,6 +7,7 @@ A simple macOS menu bar application that displays available disk space and RAM u
 - Shows available disk space and RAM used in the menu bar, alternating once per minute.
 - Hover over the menu bar item to temporarily peek at the other metric.
 - Keeps disk space, RAM used/total, and macOS memory pressure visible together in the menu.
+- Hover over RAM Used in the menu for the five processes using the most resident memory.
 - Opens DaisyDisk from the menu when installed, or macOS Storage Settings otherwise.
 
 RAM used is estimated from active, wired, and compressed memory. Memory pressure is the

@@ -64,6 +64,13 @@ struct MemoryUtils {
     }
 
     static func formatGB(_ bytes: UInt64) -> String {
-        String(format: "%.1f GB", Double(bytes) / 1_000_000_000)
+        String(format: "%.1f GB", Double(bytes) / 1_073_741_824)
+    }
+
+    static func formatCapacity(_ bytes: UInt64) -> String {
+        let gibibytes = Double(bytes) / 1_073_741_824
+        let capacities = [2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 128, 256, 512]
+        let nearest = capacities.min { abs(Double($0) - gibibytes) < abs(Double($1) - gibibytes) }!
+        return "\(nearest) GB"
     }
 }
